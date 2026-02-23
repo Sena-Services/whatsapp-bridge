@@ -262,8 +262,21 @@ async function startBaileys() {
       const isLidJid = remoteJid.endsWith('@lid');
       // For self-chat: remoteJid may be phone@s.whatsapp.net OR lid@lid
       // Check both: direct phone match, or LID that resolves to connected phone
-      const isSelfChat = remoteId === connectedPhone
+      // Also try disk lookup if in-memory map doesn't have the LID yet (fresh start)
+      let isSelfChat = remoteId === connectedPhone
         || (isLidJid && lidToPhone[remoteId] === connectedPhone);
+      if (!isSelfChat && isLidJid && msg.key.fromMe) {
+        try {
+          const reverseFile = path.join(SESSION_DIR, `lid-mapping-${remoteId}_reverse.json`);
+          if (fs.existsSync(reverseFile)) {
+            const mapped = JSON.parse(fs.readFileSync(reverseFile, 'utf8'));
+            if (mapped === connectedPhone) {
+              lidToPhone[remoteId] = mapped;
+              isSelfChat = true;
+            }
+          }
+        } catch (_) {}
+      }
       if (msg.key.fromMe) {
         if (!isSelfChat) continue;
         console.log(`[bridge] Self-chat message detected (remoteJid=${remoteJid}, connectedPhone=${connectedPhone})`);
