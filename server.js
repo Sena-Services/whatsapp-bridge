@@ -17,6 +17,7 @@ if (!globalThis.crypto) {
  * Environment variables:
  *   PORT         — HTTP port (default: 3001)
  *   WEBHOOK_URL  — URL to POST inbound messages to
+ *   BRIDGE_URL   — Override the URL the bridge registers as (default: http://localhost:PORT)
  *   API_KEY      — Optional API key for webhook auth
  *   LOG_LEVEL    — Logging level (default: info)
  *   SESSION_DIR  — Directory for session data (default: ./sessions)
@@ -592,6 +593,47 @@ server.listen(PORT, () => {
   if (WEBHOOK_URL) {
     console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
   }
+
+  // Self-register with backend so it knows our URL
+  if (WEBHOOK_URL) {
+    const bridgeUrl = process.env.BRIDGE_URL || `http://localhost:${PORT}`;
+    const registerUrl = WEBHOOK_URL.replace("receive_webhook", "register_bridge");
+    (async () => {
+      try {
+        const body = JSON.stringify({ bridge_url: bridgeUrl });
+        const url = new URL(registerUrl);
+        const proto = url.protocol === "https:" ? require("https") : http;
+        await new Promise((resolve, reject) => {
+          const req = proto.request(
+            {
+              hostname: url.hostname,
+              port: url.port || (url.protocol === "https:" ? 443 : 80),
+              path: url.pathname + url.search,
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body),
+              },
+            },
+            (res) => {
+              let data = "";
+              res.on("data", (chunk) => (data += chunk));
+              res.on("end", () => {
+                console.log(`[bridge] Registered with backend: ${data}`);
+                resolve();
+              });
+            }
+          );
+          req.on("error", reject);
+          req.write(body);
+          req.end();
+        });
+      } catch (err) {
+        console.error(`[bridge] Failed to register with backend: ${err.message}`);
+      }
+    })();
+  }
+
   startBaileys().catch((err) => {
     console.error("[bridge] Failed to start Baileys:", err.message);
     lastError = err.message;
