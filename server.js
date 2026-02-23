@@ -32,6 +32,9 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
 } = require("@whiskeysockets/baileys");
+
+// In-memory LID → phone map. Populated from contacts events.
+const lidToPhone = {};
 const QRCode = require("qrcode");
 const pino = require("pino");
 
@@ -46,6 +49,38 @@ const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, "sessions");
 
 const logger = pino({ level: LOG_LEVEL === "debug" ? "debug" : "warn" });
+
+// ---------------------------------------------------------------------------
+// Message store & retry cache (fixes "Waiting for this message" issue)
+// ---------------------------------------------------------------------------
+
+// In-memory message store: maps serialized key -> message content.
+// When WhatsApp requests a retry (pre-key re-negotiation), Baileys needs
+// the original message content to re-encrypt and resend.
+const messageStore = new Map();
+const MAX_STORE_SIZE = 5000;
+
+function storeMessage(key, message) {
+  const id = `${key.remoteJid}:${key.id}`;
+  messageStore.set(id, message);
+  if (messageStore.size > MAX_STORE_SIZE) {
+    const firstKey = messageStore.keys().next().value;
+    messageStore.delete(firstKey);
+  }
+}
+
+async function getMessage(key) {
+  const id = `${key.remoteJid}:${key.id}`;
+  return messageStore.get(id) || undefined;
+}
+
+// Simple retry counter cache (tracks message retry counts across restarts)
+const msgRetryCounterMap = new Map();
+const msgRetryCounterCache = {
+  get: (key) => msgRetryCounterMap.get(key),
+  set: (key, val) => msgRetryCounterMap.set(key, val),
+  del: (key) => msgRetryCounterMap.delete(key),
+};
 
 // ---------------------------------------------------------------------------
 // State
@@ -77,12 +112,37 @@ async function startBaileys() {
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     logger,
+    browser: ["Sena Agent", "Chrome", "1.0.0"],
+    markOnlineOnConnect: false,
     printQRInTerminal: true,
     generateHighQualityLinkPreview: false,
+    syncFullHistory: false,
+    msgRetryCounterCache,
+    getMessage,
   });
 
   // Save credentials on update
   sock.ev.on("creds.update", saveCreds);
+
+  // Build LID → phone map from contacts
+  sock.ev.on("contacts.set", ({ contacts }) => {
+    for (const c of contacts) {
+      if (c.id && c.id.endsWith("@lid") && c.phoneNumber) {
+        const lid = c.id.split("@")[0];
+        const phone = c.phoneNumber.replace("+", "").replace(/\s|-/g, "");
+        lidToPhone[lid] = phone;
+      }
+    }
+  });
+  sock.ev.on("contacts.update", (updates) => {
+    for (const c of updates) {
+      if (c.id && c.id.endsWith("@lid") && c.phoneNumber) {
+        const lid = c.id.split("@")[0];
+        const phone = c.phoneNumber.replace("+", "").replace(/\s|-/g, "");
+        lidToPhone[lid] = phone;
+      }
+    }
+  });
 
   // Connection updates
   sock.ev.on("connection.update", async (update) => {
@@ -139,6 +199,13 @@ async function startBaileys() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
+    // Store all messages (including outgoing) for retry resolution
+    for (const msg of messages) {
+      if (msg.message) {
+        storeMessage(msg.key, msg.message);
+      }
+    }
+
     for (const msg of messages) {
       if (msg.key.fromMe) continue;
 
@@ -150,8 +217,11 @@ async function startBaileys() {
       if (!text) continue;
 
       const from = msg.key.remoteJid || "";
-      // Extract phone from JID
-      const phone = from.split("@")[0];
+      // Extract raw identifier from JID (may be LID or phone number)
+      const rawId = from.split("@")[0];
+      const isLid = from.endsWith("@lid");
+      // Resolve to actual phone: check lid map, otherwise use rawId as-is
+      const phone = isLid ? (lidToPhone[rawId] || rawId) : rawId;
       // Chat ID for group or individual
       const chatId = from;
       // Sender JID (for groups this is the participant, for 1:1 it's the remoteJid)
@@ -159,11 +229,12 @@ async function startBaileys() {
       // Push name
       const fromName = msg.pushName || "";
 
-      console.log(`[bridge] Message from ${phone}: ${text.substring(0, 80)}`);
+      console.log(`[bridge] Message from ${phone} (lid=${isLid ? rawId : "n/a"}): ${text.substring(0, 80)}`);
 
       if (WEBHOOK_URL) {
         sendWebhook({
           from: phone,
+          from_lid: isLid ? rawId : "",
           from_jid: fromJid,
           chat_id: chatId,
           from_name: fromName,
@@ -225,6 +296,10 @@ async function sendMessage(to, text) {
 
   try {
     const result = await sock.sendMessage(to, { text });
+    // Store sent message for retry resolution
+    if (result?.key) {
+      storeMessage(result.key, result.message);
+    }
     return { messageId: result?.key?.id || "" };
   } catch (err) {
     return { error: err.message };
@@ -254,6 +329,10 @@ async function sendMedia(to, mediaUrl, mediaType, caption) {
     }
 
     const result = await sock.sendMessage(to, msgContent);
+    // Store sent message for retry resolution
+    if (result?.key) {
+      storeMessage(result.key, result.message);
+    }
     return { messageId: result?.key?.id || "" };
   } catch (err) {
     return { error: err.message };

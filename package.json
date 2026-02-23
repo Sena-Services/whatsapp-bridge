@@ -17,7 +17,7 @@
     "build:win": "npx @yao-pkg/pkg . --target node20-win-x64 --output dist/sena-whatsapp-win.exe"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4"
   },
