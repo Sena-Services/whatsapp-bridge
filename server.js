@@ -33,8 +33,55 @@ const {
   makeCacheableSignalKeyStore,
 } = require("@whiskeysockets/baileys");
 
-// In-memory LID → phone map. Populated from contacts events.
-const lidToPhone = {};
+// In-memory LID → phone map. Populated from contacts events, persisted to disk.
+let lidToPhone = {};
+function loadLidMap() {
+  try {
+    if (fs.existsSync(LID_MAP_PATH)) {
+      lidToPhone = JSON.parse(fs.readFileSync(LID_MAP_PATH, 'utf8'));
+      console.log(`[bridge] Loaded ${Object.keys(lidToPhone).length} LID mappings from lid_map.json`);
+    }
+  } catch (e) {
+    console.error('[bridge] Failed to load LID map:', e.message);
+    lidToPhone = {};
+  }
+  // Also load individual lid-mapping-*_reverse.json files (LID → phone)
+  try {
+    const files = fs.readdirSync(SESSION_DIR).filter(f => f.endsWith('_reverse.json') && f.startsWith('lid-mapping-'));
+    for (const f of files) {
+      try {
+        const lid = f.replace('lid-mapping-', '').replace('_reverse.json', '');
+        const phone = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+        if (lid && phone && !lidToPhone[lid]) {
+          lidToPhone[lid] = phone;
+        }
+      } catch (_) {}
+    }
+    if (Object.keys(lidToPhone).length > 0) {
+      console.log(`[bridge] Total LID mappings after loading: ${Object.keys(lidToPhone).length}`);
+    }
+  } catch (_) {}
+}
+
+let _lidSaveTimer = null;
+function saveLidMap() {
+  if (_lidSaveTimer) clearTimeout(_lidSaveTimer);
+  _lidSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(LID_MAP_PATH, JSON.stringify(lidToPhone), 'utf8');
+      // Also write individual files for compatibility
+      for (const [lid, phone] of Object.entries(lidToPhone)) {
+        try {
+          fs.writeFileSync(path.join(SESSION_DIR, `lid-mapping-${phone}.json`), JSON.stringify(lid), 'utf8');
+          fs.writeFileSync(path.join(SESSION_DIR, `lid-mapping-${lid}_reverse.json`), JSON.stringify(phone), 'utf8');
+        } catch (_) {}
+      }
+    } catch (e) {
+      console.error('[bridge] Failed to save LID map:', e.message);
+    }
+  }, 2000);
+}
+
 const QRCode = require("qrcode");
 const pino = require("pino");
 
@@ -47,6 +94,8 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const API_KEY = process.env.API_KEY || "";
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, "sessions");
+const LID_MAP_PATH = path.join(SESSION_DIR, 'lid_map.json');
+loadLidMap();
 
 const logger = pino({ level: LOG_LEVEL === "debug" ? "debug" : "warn" });
 
@@ -125,24 +174,23 @@ async function startBaileys() {
   sock.ev.on("creds.update", saveCreds);
 
   // Build LID → phone map from contacts
-  sock.ev.on("contacts.set", ({ contacts }) => {
+  function absorbContacts(contacts) {
+    let changed = false;
     for (const c of contacts) {
       if (c.id && c.id.endsWith("@lid") && c.phoneNumber) {
         const lid = c.id.split("@")[0];
         const phone = c.phoneNumber.replace("+", "").replace(/\s|-/g, "");
-        lidToPhone[lid] = phone;
+        if (lidToPhone[lid] !== phone) {
+          lidToPhone[lid] = phone;
+          changed = true;
+        }
       }
     }
-  });
-  sock.ev.on("contacts.update", (updates) => {
-    for (const c of updates) {
-      if (c.id && c.id.endsWith("@lid") && c.phoneNumber) {
-        const lid = c.id.split("@")[0];
-        const phone = c.phoneNumber.replace("+", "").replace(/\s|-/g, "");
-        lidToPhone[lid] = phone;
-      }
-    }
-  });
+    if (changed) saveLidMap();
+  }
+  sock.ev.on("contacts.set", ({ contacts }) => absorbContacts(contacts));
+  sock.ev.on("contacts.update", (updates) => absorbContacts(updates));
+  sock.ev.on("contacts.upsert", (contacts) => absorbContacts(contacts));
 
   // Connection updates
   sock.ev.on("connection.update", async (update) => {
@@ -220,8 +268,36 @@ async function startBaileys() {
       // Extract raw identifier from JID (may be LID or phone number)
       const rawId = from.split("@")[0];
       const isLid = from.endsWith("@lid");
-      // Resolve to actual phone: check lid map, otherwise use rawId as-is
-      const phone = isLid ? (lidToPhone[rawId] || rawId) : rawId;
+      // Resolve to actual phone: check lid map, then sock.contacts, then fall back to rawId
+      let phone = rawId;
+      if (isLid) {
+        if (lidToPhone[rawId]) {
+          phone = lidToPhone[rawId];
+        } else {
+          // Try sock.contacts (populated by Baileys from session/sync)
+          const contact = sock.contacts && sock.contacts[from];
+          const contactPhone = contact?.phoneNumber;
+          if (contactPhone) {
+            phone = contactPhone.replace("+", "").replace(/\s|-/g, "");
+            lidToPhone[rawId] = phone;
+            saveLidMap();
+            console.log(`[bridge] Resolved LID ${rawId} → ${phone} via sock.contacts`);
+          } else {
+            // Try individual mapping file on disk
+            try {
+              const reverseFile = path.join(SESSION_DIR, `lid-mapping-${rawId}_reverse.json`);
+              if (fs.existsSync(reverseFile)) {
+                const mapped = JSON.parse(fs.readFileSync(reverseFile, 'utf8'));
+                if (mapped) {
+                  phone = mapped;
+                  lidToPhone[rawId] = phone;
+                  console.log(`[bridge] Resolved LID ${rawId} → ${phone} via mapping file`);
+                }
+              }
+            } catch (_) {}
+          }
+        }
+      }
       // Chat ID for group or individual
       const chatId = from;
       // Sender JID (for groups this is the participant, for 1:1 it's the remoteJid)
@@ -434,6 +510,52 @@ const server = http.createServer(async (req, res) => {
       } else {
         sendJSON(res, 200, result);
       }
+    } catch (err) {
+      sendJSON(res, 400, { error: err.message });
+    }
+    return;
+  }
+
+  // POST /resolve-numbers — forward-lookup phone numbers to get LID JIDs
+  if (url === "/resolve-numbers" && req.method === "POST") {
+    try {
+      const data = await parseBody(req);
+      const phones = data.phones || [];
+      if (!Array.isArray(phones) || phones.length === 0) {
+        sendJSON(res, 400, { error: "Missing 'phones' array" });
+        return;
+      }
+      if (!sock || connectionStatus !== "connected") {
+        sendJSON(res, 503, { error: "Not connected to WhatsApp" });
+        return;
+      }
+
+      const results = {};
+      let newMappings = 0;
+      for (const phone of phones) {
+        try {
+          const jids = await sock.onWhatsApp(phone + "@s.whatsapp.net");
+          if (jids && jids.length > 0 && jids[0].exists) {
+            const jid = jids[0].jid; // e.g. "181316456869929@lid" or "919841797623@s.whatsapp.net"
+            const jidId = jid.split("@")[0];
+            const isLid = jid.endsWith("@lid");
+            results[phone] = { jid, isLid };
+            if (isLid && lidToPhone[jidId] !== phone) {
+              lidToPhone[jidId] = phone;
+              newMappings++;
+            }
+          } else {
+            results[phone] = { jid: null, isLid: false };
+          }
+        } catch (err) {
+          results[phone] = { error: err.message };
+        }
+      }
+      if (newMappings > 0) {
+        saveLidMap();
+        console.log(`[bridge] resolve-numbers: ${newMappings} new LID mappings saved`);
+      }
+      sendJSON(res, 200, { resolved: results, total_mappings: Object.keys(lidToPhone).length });
     } catch (err) {
       sendJSON(res, 400, { error: err.message });
     }
