@@ -255,7 +255,18 @@ async function startBaileys() {
     }
 
     for (const msg of messages) {
-      if (msg.key.fromMe) continue;
+      // Allow self-chat (phone texting itself) through, but skip other outgoing messages
+      const remoteJid = msg.key.remoteJid || '';
+      const remoteId = remoteJid.split('@')[0] || '';
+      const isLidJid = remoteJid.endsWith('@lid');
+      // For self-chat: remoteJid may be phone@s.whatsapp.net OR lid@lid
+      // Check both: direct phone match, or LID that resolves to connected phone
+      const isSelfChat = remoteId === connectedPhone
+        || (isLidJid && lidToPhone[remoteId] === connectedPhone);
+      if (msg.key.fromMe) {
+        if (!isSelfChat) continue;
+        console.log(`[bridge] Self-chat message detected (remoteJid=${remoteJid}, connectedPhone=${connectedPhone})`);
+      }
 
       const text =
         msg.message?.conversation ||
