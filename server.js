@@ -345,6 +345,25 @@ async function startBaileys() {
       }
     }
   });
+
+  // Outbound message status updates (sent / delivered / read)
+  sock.ev.on("messages.update", (updates) => {
+    if (!WEBHOOK_URL) return;
+    const STATUS_MAP = { 2: "sent", 3: "delivered", 4: "read" };
+    for (const { key, update } of updates) {
+      const status = update.status;
+      if (!status || status < 2) continue;
+      const label = STATUS_MAP[status];
+      if (!label) continue;
+      console.log(`[bridge] Status update: ${key.id} → ${label}`);
+      sendWebhook({
+        type: "status_update",
+        message_id: key.id || "",
+        remote_jid: key.remoteJid || "",
+        status: label,
+      });
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +437,9 @@ async function sendMedia(to, mediaUrl, mediaType, caption) {
       msgContent = { image: { url: mediaUrl }, caption: caption || undefined };
     } else if (mediaType === "video") {
       msgContent = { video: { url: mediaUrl }, caption: caption || undefined };
+    } else if (mediaType === "audio") {
+      // Send as voice note (ptt = push-to-talk)
+      msgContent = { audio: { url: mediaUrl }, ptt: true, mimetype: "audio/ogg; codecs=opus" };
     } else {
       // document
       const fileName = mediaUrl.split("/").pop() || "document";
