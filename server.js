@@ -90,13 +90,57 @@ const pino = require("pino");
 // Config
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// CLI arg parsing (--server, --token for remote mode)
+// ---------------------------------------------------------------------------
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const parsed = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--server" && args[i + 1]) {
+      parsed.server = args[++i].replace(/\/+$/, "");
+    } else if (args[i] === "--token" && args[i + 1]) {
+      parsed.token = args[++i];
+    } else if (args[i] === "--help" || args[i] === "-h") {
+      console.log(`
+Sena WhatsApp Bridge
+
+Usage:
+  npx sena-whatsapp-bridge --server https://yoursite.senaerp.com --token <token>
+
+Options:
+  --server <url>    Sena server URL (enables remote mode)
+  --token <token>   Bridge authentication token (required with --server)
+  --help            Show this help message
+
+Environment variables:
+  PORT              HTTP port (default: 3001)
+  LOG_LEVEL         Logging level (default: info)
+  SESSION_DIR       Directory for session data (default: ./sessions)
+`);
+      process.exit(0);
+    }
+  }
+  return parsed;
+}
+
+const CLI_ARGS = parseArgs();
+const REMOTE_MODE = !!(CLI_ARGS.server && CLI_ARGS.token);
+const REMOTE_SERVER = CLI_ARGS.server || "";
+const BRIDGE_TOKEN = CLI_ARGS.token || "";
+
 const PORT = parseInt(process.env.PORT || "3001", 10);
-const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const API_KEY = process.env.API_KEY || "";
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, "sessions");
 const LID_MAP_PATH = path.join(SESSION_DIR, 'lid_map.json');
 loadLidMap();
+
+// In remote mode, derive WEBHOOK_URL and API_KEY from server + token
+const WEBHOOK_URL = REMOTE_MODE
+  ? `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.receive_webhook`
+  : (process.env.WEBHOOK_URL || "");
+const API_KEY = REMOTE_MODE ? BRIDGE_TOKEN : (process.env.API_KEY || "");
 
 const logger = pino({ level: LOG_LEVEL === "debug" ? "debug" : "warn" });
 
@@ -202,6 +246,7 @@ async function startBaileys() {
         qrDataUrl = await QRCode.toDataURL(qr, { width: 256, margin: 2 });
         connectionStatus = "qr_ready";
         console.log("[bridge] QR code generated");
+        pushToServer({ type: "qr", qr_data_url: qrDataUrl });
       } catch (err) {
         console.error("[bridge] QR generation failed:", err.message);
       }
@@ -219,6 +264,7 @@ async function startBaileys() {
       connectionStatus = "disconnected";
       qrDataUrl = "";
       connectedPhone = "";
+      pushToServer({ type: "status", status: "disconnected" });
 
       if (shouldReconnect) {
         lastError = `Disconnected (code ${statusCode}), reconnecting...`;
@@ -241,6 +287,8 @@ async function startBaileys() {
       const me = sock.user;
       connectedPhone = me?.id?.split(":")[0] || me?.id?.split("@")[0] || "";
       console.log(`[bridge] Connected as ${connectedPhone}`);
+      pushToServer({ type: "status", status: "connected", phone: connectedPhone });
+      startPollLoop();
     }
   });
 
@@ -404,6 +452,129 @@ function sendWebhook(payload) {
   req.write(body);
   req.end();
 }
+
+// ---------------------------------------------------------------------------
+// Remote mode: push to server + poll for outbound
+// ---------------------------------------------------------------------------
+
+function pushToServer(data) {
+  if (!REMOTE_MODE) return;
+  data.token = BRIDGE_TOKEN;
+  const body = JSON.stringify(data);
+  const pushUrl = `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.bridge_push`;
+  const url = new URL(pushUrl);
+  const proto = url.protocol === "https:" ? require("https") : http;
+  const req = proto.request(
+    {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    },
+    (res) => {
+      let d = "";
+      res.on("data", (chunk) => (d += chunk));
+      res.on("end", () => {
+        if (res.statusCode >= 400) {
+          console.error(`[remote] push failed: HTTP ${res.statusCode} ${d.substring(0, 200)}`);
+        }
+      });
+    }
+  );
+  req.on("error", (err) => {
+    console.error(`[remote] push error: ${err.message}`);
+  });
+  req.write(body);
+  req.end();
+}
+
+let _pollTimer = null;
+
+function startPollLoop() {
+  if (!REMOTE_MODE) return;
+  console.log("[remote] Starting poll loop for outbound messages");
+
+  async function poll() {
+    const pollUrl = `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.bridge_poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`;
+    try {
+      const url = new URL(pollUrl);
+      const proto = url.protocol === "https:" ? require("https") : http;
+      const data = await new Promise((resolve, reject) => {
+        const req = proto.request(
+          {
+            hostname: url.hostname,
+            port: url.port || (url.protocol === "https:" ? 443 : 80),
+            path: url.pathname + url.search,
+            method: "GET",
+            headers: { "X-Bridge-Token": BRIDGE_TOKEN },
+          },
+          (res) => {
+            let body = "";
+            res.on("data", (chunk) => (body += chunk));
+            res.on("end", () => {
+              try {
+                // Frappe wraps responses in {"message": ...}
+                const parsed = JSON.parse(body);
+                resolve(parsed.message || parsed);
+              } catch (e) {
+                reject(new Error(`Invalid JSON: ${body.substring(0, 100)}`));
+              }
+            });
+          }
+        );
+        req.on("error", reject);
+        req.setTimeout(10000, () => { req.destroy(); reject(new Error("Poll timeout")); });
+        req.end();
+      });
+
+      if (data.type === "send") {
+        console.log(`[remote] Outbound send: to=${data.to}`);
+        const result = await sendMessage(data.to, data.text || data.message || "");
+        pushToServer({
+          type: "send_result",
+          request_id: data.request_id,
+          ok: !result.error,
+          message_id: result.messageId || "",
+          error: result.error || "",
+        });
+      } else if (data.type === "send_media") {
+        console.log(`[remote] Outbound media: to=${data.to} type=${data.media_type}`);
+        const result = await sendMedia(
+          data.to,
+          data.media_url,
+          data.media_type || "document",
+          data.caption || ""
+        );
+        pushToServer({
+          type: "send_result",
+          request_id: data.request_id,
+          ok: !result.error,
+          message_id: result.messageId || "",
+          error: result.error || "",
+        });
+      }
+      // else type === "noop" — nothing to do
+    } catch (err) {
+      console.error(`[remote] Poll error: ${err.message}`);
+    }
+
+    _pollTimer = setTimeout(poll, 1500);
+  }
+
+  poll();
+}
+
+function stopPollLoop() {
+  if (_pollTimer) {
+    clearTimeout(_pollTimer);
+    _pollTimer = null;
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Send message
@@ -625,12 +796,15 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[bridge] Sena WhatsApp Bridge listening on port ${PORT}`);
-  if (WEBHOOK_URL) {
-    console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
-  }
 
-  // Self-register with backend so it knows our URL
-  if (WEBHOOK_URL) {
+  if (REMOTE_MODE) {
+    console.log(`[bridge] Remote mode: server=${REMOTE_SERVER}`);
+    console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
+    pushToServer({ type: "status", status: "starting" });
+  } else if (WEBHOOK_URL) {
+    console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
+
+    // Self-register with backend (local mode only)
     const bridgeUrl = process.env.BRIDGE_URL || `http://localhost:${PORT}`;
     const registerUrl = WEBHOOK_URL.replace("receive_webhook", "register_bridge");
     (async () => {
@@ -678,12 +852,16 @@ server.listen(PORT, () => {
 // Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("[bridge] SIGTERM received, shutting down...");
+  stopPollLoop();
+  pushToServer({ type: "status", status: "disconnected" });
   sock?.end?.();
   server.close(() => process.exit(0));
 });
 
 process.on("SIGINT", () => {
   console.log("[bridge] SIGINT received, shutting down...");
+  stopPollLoop();
+  pushToServer({ type: "status", status: "disconnected" });
   sock?.end?.();
   server.close(() => process.exit(0));
 });
