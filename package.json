@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Sena WhatsApp Bridge — Baileys-based WhatsApp Web client with HTTP API",
   "main": "server.js",
+  "files": [
+    "server.js"
+  ],
   "bin": {
     "sena-whatsapp-bridge": "server.js"
   },
@@ -15,8 +18,13 @@
   },
   "scripts": {
     "start": "node server.js",
-    "build:mac": "npx @yao-pkg/pkg . --target node20-macos-x64 --output dist/sena-whatsapp-mac",
-    "build:win": "npx @yao-pkg/pkg . --target node20-win-x64 --output dist/sena-whatsapp-win.exe"
+    "build:win-x64": "npx @yao-pkg/pkg . --target node20-win-x64 --output dist/sena-whatsapp-win-x64.exe",
+    "build:win-arm64": "npx @yao-pkg/pkg . --target node20-win-arm64 --output dist/sena-whatsapp-win-arm64.exe",
+    "build:mac-x64": "npx @yao-pkg/pkg . --target node20-macos-x64 --output dist/sena-whatsapp-mac-x64",
+    "build:mac-arm64": "npx @yao-pkg/pkg . --target node20-macos-arm64 --output dist/sena-whatsapp-mac-arm64",
+    "build:linux-x64": "npx @yao-pkg/pkg . --target node20-linux-x64 --output dist/sena-whatsapp-linux-x64",
+    "build:linux-arm64": "npx @yao-pkg/pkg . --target node20-linux-arm64 --output dist/sena-whatsapp-linux-arm64",
+    "build:all": "npm run build:win-x64 && npm run build:win-arm64 && npm run build:mac-x64 && npm run build:mac-arm64 && npm run build:linux-x64 && npm run build:linux-arm64"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
