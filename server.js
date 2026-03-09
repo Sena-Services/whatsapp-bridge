@@ -138,7 +138,7 @@ loadLidMap();
 
 // In remote mode, derive WEBHOOK_URL and API_KEY from server + token
 const WEBHOOK_URL = REMOTE_MODE
-  ? `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.receive_webhook`
+  ? `${REMOTE_SERVER}/api/method/sena_whatsapp.api.whatsapp.receive_webhook`
   : (process.env.WEBHOOK_URL || "");
 const API_KEY = REMOTE_MODE ? BRIDGE_TOKEN : (process.env.API_KEY || "");
 
@@ -461,7 +461,7 @@ function pushToServer(data) {
   if (!REMOTE_MODE) return;
   data.token = BRIDGE_TOKEN;
   const body = JSON.stringify(data);
-  const pushUrl = `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.bridge_push`;
+  const pushUrl = `${REMOTE_SERVER}/api/method/sena_whatsapp.api.whatsapp.bridge_push`;
   const url = new URL(pushUrl);
   const proto = url.protocol === "https:" ? require("https") : http;
   const req = proto.request(
@@ -499,7 +499,7 @@ function startPollLoop() {
   console.log("[remote] Starting poll loop for outbound messages");
 
   async function poll() {
-    const pollUrl = `${REMOTE_SERVER}/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.bridge_poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`;
+    const pollUrl = `${REMOTE_SERVER}/api/method/sena_whatsapp.api.whatsapp.bridge_poll?token=${encodeURIComponent(BRIDGE_TOKEN)}`;
     try {
       const url = new URL(pollUrl);
       const proto = url.protocol === "https:" ? require("https") : http;
@@ -794,60 +794,79 @@ const server = http.createServer(async (req, res) => {
 // Start
 // ---------------------------------------------------------------------------
 
-server.listen(PORT, () => {
-  console.log(`[bridge] Sena WhatsApp Bridge listening on port ${PORT}`);
+function startServer(port) {
+  server.listen(port, () => {
+    console.log(`[bridge] Sena WhatsApp Bridge listening on port ${port}`);
 
-  if (REMOTE_MODE) {
-    console.log(`[bridge] Remote mode: server=${REMOTE_SERVER}`);
-    console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
-    pushToServer({ type: "status", status: "starting" });
-  } else if (WEBHOOK_URL) {
-    console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
+    if (REMOTE_MODE) {
+      console.log(`[bridge] Remote mode: server=${REMOTE_SERVER}`);
+      console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
+      pushToServer({ type: "status", status: "starting" });
+    } else if (WEBHOOK_URL) {
+      console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
 
-    // Self-register with backend (local mode only)
-    const bridgeUrl = process.env.BRIDGE_URL || `http://localhost:${PORT}`;
-    const registerUrl = WEBHOOK_URL.replace("receive_webhook", "register_bridge");
-    (async () => {
-      try {
-        const body = JSON.stringify({ bridge_url: bridgeUrl });
-        const url = new URL(registerUrl);
-        const proto = url.protocol === "https:" ? require("https") : http;
-        await new Promise((resolve, reject) => {
-          const req = proto.request(
-            {
-              hostname: url.hostname,
-              port: url.port || (url.protocol === "https:" ? 443 : 80),
-              path: url.pathname + url.search,
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(body),
+      // Self-register with backend (local mode only)
+      const bridgeUrl = process.env.BRIDGE_URL || `http://localhost:${port}`;
+      const registerUrl = WEBHOOK_URL.replace("receive_webhook", "register_bridge");
+      (async () => {
+        try {
+          const body = JSON.stringify({ bridge_url: bridgeUrl });
+          const url = new URL(registerUrl);
+          const proto = url.protocol === "https:" ? require("https") : http;
+          await new Promise((resolve, reject) => {
+            const req = proto.request(
+              {
+                hostname: url.hostname,
+                port: url.port || (url.protocol === "https:" ? 443 : 80),
+                path: url.pathname + url.search,
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Content-Length": Buffer.byteLength(body),
+                },
               },
-            },
-            (res) => {
-              let data = "";
-              res.on("data", (chunk) => (data += chunk));
-              res.on("end", () => {
-                console.log(`[bridge] Registered with backend: ${data}`);
-                resolve();
-              });
-            }
-          );
-          req.on("error", reject);
-          req.write(body);
-          req.end();
-        });
-      } catch (err) {
-        console.error(`[bridge] Failed to register with backend: ${err.message}`);
-      }
-    })();
-  }
+              (res) => {
+                let data = "";
+                res.on("data", (chunk) => (data += chunk));
+                res.on("end", () => {
+                  console.log(`[bridge] Registered with backend: ${data}`);
+                  resolve();
+                });
+              }
+            );
+            req.on("error", reject);
+            req.write(body);
+            req.end();
+          });
+        } catch (err) {
+          console.error(`[bridge] Failed to register with backend: ${err.message}`);
+        }
+      })();
+    }
 
-  startBaileys().catch((err) => {
-    console.error("[bridge] Failed to start Baileys:", err.message);
-    lastError = err.message;
+    startBaileys().catch((err) => {
+      console.error("[bridge] Failed to start Baileys:", err.message);
+      lastError = err.message;
+    });
   });
-});
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      const nextPort = port + 1;
+      if (nextPort > PORT + 10) {
+        console.error(`[bridge] Could not find a free port (tried ${PORT}-${port}). Exiting.`);
+        process.exit(1);
+      }
+      console.log(`[bridge] Port ${port} is in use, trying ${nextPort}...`);
+      server.removeAllListeners("error");
+      startServer(nextPort);
+    } else {
+      throw err;
+    }
+  });
+}
+
+startServer(PORT);
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
