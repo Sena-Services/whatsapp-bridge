@@ -479,6 +479,14 @@ function pushToServer(data) {
       let d = "";
       res.on("data", (chunk) => (d += chunk));
       res.on("end", () => {
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          console.error(`[remote] Token revoked or invalid (HTTP ${res.statusCode}). Shutting down.`);
+          _shutdownRequested = true;
+          stopPollLoop();
+          sock?.end?.();
+          server.close(() => process.exit(1));
+          return;
+        }
         if (res.statusCode >= 400) {
           console.error(`[remote] push failed: HTTP ${res.statusCode} ${d.substring(0, 200)}`);
         }
@@ -493,9 +501,11 @@ function pushToServer(data) {
 }
 
 let _pollTimer = null;
+let _shutdownRequested = false;
 
 function startPollLoop() {
   if (!REMOTE_MODE) return;
+  if (_pollTimer) return;  // Already running
   console.log("[remote] Starting poll loop for outbound messages");
 
   async function poll() {
@@ -516,6 +526,16 @@ function startPollLoop() {
             let body = "";
             res.on("data", (chunk) => (body += chunk));
             res.on("end", () => {
+              if (res.statusCode === 401 || res.statusCode === 403) {
+                console.error("[remote] Token revoked or invalid (HTTP " + res.statusCode + "). Shutting down.");
+                _shutdownRequested = true;
+                stopPollLoop();
+                pushToServer({ type: "status", status: "disconnected" });
+                sock?.end?.();
+                server.close(() => process.exit(1));
+                reject(new Error("Token revoked"));
+                return;
+              }
               try {
                 // Frappe wraps responses in {"message": ...}
                 const parsed = JSON.parse(body);
@@ -556,13 +576,38 @@ function startPollLoop() {
           message_id: result.messageId || "",
           error: result.error || "",
         });
+      } else if (data.type === "disconnect") {
+        console.log("[remote] Received disconnect command from server. Clearing session and shutting down.");
+        try {
+          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+          fs.mkdirSync(SESSION_DIR, { recursive: true });
+          console.log("[remote] Local session cleared");
+        } catch (e) {
+          console.error("[remote] Failed to clear session:", e.message);
+        }
+        _shutdownRequested = true;
+        stopPollLoop();
+        pushToServer({ type: "status", status: "disconnected" });
+        sock?.end?.();
+        server.close(() => process.exit(0));
+        return;
+      } else if (data.type === "shutdown") {
+        console.log("[remote] Received shutdown command from server. Exiting (session preserved).");
+        _shutdownRequested = true;
+        stopPollLoop();
+        pushToServer({ type: "status", status: "disconnected" });
+        sock?.end?.();
+        server.close(() => process.exit(0));
+        return;
       }
       // else type === "noop" — nothing to do
     } catch (err) {
       console.error(`[remote] Poll error: ${err.message}`);
     }
 
-    _pollTimer = setTimeout(poll, 1500);
+    if (!_shutdownRequested) {
+      _pollTimer = setTimeout(poll, 1500);
+    }
   }
 
   poll();
@@ -802,6 +847,7 @@ function startServer(port) {
       console.log(`[bridge] Remote mode: server=${REMOTE_SERVER}`);
       console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
       pushToServer({ type: "status", status: "starting" });
+      startPollLoop();  // Start polling immediately so we receive commands even during QR state
     } else if (WEBHOOK_URL) {
       console.log(`[bridge] Webhook URL: ${WEBHOOK_URL}`);
 

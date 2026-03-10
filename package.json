@@ -1,6 +1,6 @@
 {
   "name": "sena-wa-bridge",
-  "version": "1.0.1",
+  "version": "1.0.6",
   "description": "Sena WhatsApp Bridge — Baileys-based WhatsApp Web client with HTTP API",
   "main": "server.js",
   "bin": {

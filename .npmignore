@@ -1,0 +1,5 @@
+sessions/
+lid_map.json
+*.log
+dist/
+node_modules/
