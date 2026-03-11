@@ -380,6 +380,43 @@ async function startBaileys() {
 
       console.log(`[bridge] Message from ${phone} (lid=${isLid ? rawId : "n/a"}): ${text.substring(0, 80)}`);
 
+      // Detect group messages
+      const isGroup = remoteJid.endsWith('@g.us');
+
+      if (isGroup) {
+        // For groups: resolve the SENDER's phone from participant JID
+        const participantJid = msg.key.participant || '';
+        const participantRaw = participantJid.split('@')[0];
+        // Check if participant is LID and resolve
+        let senderPhone = participantRaw;
+        if (participantJid.endsWith('@lid') && lidToPhone[participantRaw]) {
+          senderPhone = lidToPhone[participantRaw];
+        }
+
+        // Try to get group name from store
+        let groupName = '';
+        try {
+          const groupMeta = await sock.groupMetadata(remoteJid);
+          groupName = groupMeta?.subject || '';
+        } catch (_) {}
+
+        if (WEBHOOK_URL) {
+          sendWebhook({
+            from: senderPhone,
+            from_lid: participantJid.endsWith('@lid') ? participantRaw : "",
+            from_jid: participantJid,
+            chat_id: chatId,
+            from_name: fromName,
+            message: text,
+            message_id: msg.key.id || "",
+            is_group: true,
+            group_jid: remoteJid,
+            group_name: groupName,
+          });
+        }
+        continue; // Skip the normal personal-message webhook send below
+      }
+
       if (WEBHOOK_URL) {
         sendWebhook({
           from: phone,
