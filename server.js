@@ -32,6 +32,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 
 // In-memory LID → phone map. Populated from contacts events, persisted to disk.
@@ -335,7 +336,25 @@ async function startBaileys() {
         msg.message?.extendedTextMessage?.text ||
         "";
 
-      if (!text) continue;
+      // Detect audio/voice messages
+      const audioMsg = msg.message?.audioMessage;
+      const isAudio = !!audioMsg;
+
+      if (!text && !isAudio) continue;
+
+      // Download audio if present
+      let audioBase64 = "";
+      let audioMimetype = "";
+      if (isAudio) {
+        try {
+          const stream = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          audioBase64 = stream.toString('base64');
+          audioMimetype = audioMsg.mimetype || "audio/ogg";
+          console.log(`[bridge] Downloaded audio: ${audioBase64.length} chars base64, mime=${audioMimetype}`);
+        } catch (err) {
+          console.error(`[bridge] Failed to download audio:`, err.message || err);
+        }
+      }
 
       const from = msg.key.remoteJid || "";
       // Extract raw identifier from JID (may be LID or phone number)
@@ -393,15 +412,61 @@ async function startBaileys() {
           senderPhone = lidToPhone[participantRaw];
         }
 
-        // Try to get group name from store
+        // Try to get group name and members — retry once on failure
         let groupName = '';
-        try {
-          const groupMeta = await sock.groupMetadata(remoteJid);
-          groupName = groupMeta?.subject || '';
-        } catch (_) {}
+        let groupMembers = [];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const groupMeta = await sock.groupMetadata(remoteJid);
+            groupName = groupMeta?.subject || '';
+            groupMembers = (groupMeta?.participants || []).map(p => {
+              const rawId = p.id.split('@')[0];
+              const isLid = p.id.endsWith('@lid');
+              let phone = rawId;
+              if (isLid) {
+                // Try in-memory LID map
+                if (lidToPhone[rawId]) {
+                  phone = lidToPhone[rawId];
+                } else {
+                  // Try sock.contacts
+                  const contact = sock.contacts && sock.contacts[p.id];
+                  const contactPhone = contact?.phoneNumber;
+                  if (contactPhone) {
+                    phone = contactPhone.replace('+', '').replace(/\s|-/g, '');
+                    lidToPhone[rawId] = phone;
+                    saveLidMap();
+                  } else {
+                    // Try disk mapping file
+                    try {
+                      const reverseFile = path.join(SESSION_DIR, `lid-mapping-${rawId}_reverse.json`);
+                      if (fs.existsSync(reverseFile)) {
+                        const mapped = JSON.parse(fs.readFileSync(reverseFile, 'utf8'));
+                        if (mapped) { phone = mapped; lidToPhone[rawId] = phone; }
+                      }
+                    } catch (_) {}
+                  }
+                }
+              }
+              return {
+                jid: p.id,
+                phone: phone,
+                lid: isLid ? rawId : null,
+                admin: p.admin || null,
+                name: p.notify || p.name || null,
+              };
+            });
+            if (groupName) break;
+          } catch (err) {
+            console.error(`[bridge] groupMetadata failed (attempt ${attempt + 1}):`, err.message || err);
+            if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+          }
+        }
+        if (!groupName) {
+          console.warn(`[bridge] Could not resolve group name for ${remoteJid}, using fallback`);
+        }
 
         if (WEBHOOK_URL) {
-          sendWebhook({
+          const groupPayload = {
             from: senderPhone,
             from_lid: participantJid.endsWith('@lid') ? participantRaw : "",
             from_jid: participantJid,
@@ -412,13 +477,20 @@ async function startBaileys() {
             is_group: true,
             group_jid: remoteJid,
             group_name: groupName,
-          });
+            group_members: groupMembers,
+          };
+          if (isAudio) {
+            groupPayload.message_type = "audio";
+            groupPayload.audio_base64 = audioBase64;
+            groupPayload.audio_mimetype = audioMimetype;
+          }
+          sendWebhook(groupPayload);
         }
         continue; // Skip the normal personal-message webhook send below
       }
 
       if (WEBHOOK_URL) {
-        sendWebhook({
+        const personalPayload = {
           from: phone,
           from_lid: isLid ? rawId : "",
           from_jid: fromJid,
@@ -426,7 +498,13 @@ async function startBaileys() {
           from_name: fromName,
           message: text,
           message_id: msg.key.id || "",
-        });
+        };
+        if (isAudio) {
+          personalPayload.message_type = "audio";
+          personalPayload.audio_base64 = audioBase64;
+          personalPayload.audio_mimetype = audioMimetype;
+        }
+        sendWebhook(personalPayload);
       }
     }
   });
@@ -590,7 +668,7 @@ function startPollLoop() {
 
       if (data.type === "send") {
         console.log(`[remote] Outbound send: to=${data.to}`);
-        const result = await sendMessage(data.to, data.text || data.message || "");
+        const result = await sendMessage(data.to, data.text || data.message || "", data.mentions);
         pushToServer({
           type: "send_result",
           request_id: data.request_id,
@@ -662,13 +740,17 @@ function stopPollLoop() {
 // Send message
 // ---------------------------------------------------------------------------
 
-async function sendMessage(to, text) {
+async function sendMessage(to, text, mentions) {
   if (!sock || connectionStatus !== "connected") {
     return { error: "Not connected to WhatsApp" };
   }
 
   try {
-    const result = await sock.sendMessage(to, { text });
+    const msgPayload = { text };
+    if (mentions && Array.isArray(mentions) && mentions.length > 0) {
+      msgPayload.mentions = mentions;
+    }
+    const result = await sock.sendMessage(to, msgPayload);
     // Store sent message for retry resolution
     if (result?.key) {
       storeMessage(result.key, result.message);
@@ -682,6 +764,16 @@ async function sendMessage(to, text) {
 async function sendMedia(to, mediaUrl, mediaType, caption) {
   if (!sock || connectionStatus !== "connected") {
     return { error: "Not connected to WhatsApp" };
+  }
+
+  // Resolve relative /files/ paths to full server URL
+  if (mediaUrl && mediaUrl.startsWith("/") && REMOTE_SERVER) {
+    mediaUrl = REMOTE_SERVER + mediaUrl;
+  } else if (mediaUrl && mediaUrl.startsWith("/") && WEBHOOK_URL) {
+    try {
+      const parsed = new URL(WEBHOOK_URL);
+      mediaUrl = `${parsed.protocol}//${parsed.host}${mediaUrl}`;
+    } catch (_) {}
   }
 
   try {
@@ -802,7 +894,7 @@ const server = http.createServer(async (req, res) => {
           sendJSON(res, 400, { error: "Missing 'text' field" });
           return;
         }
-        result = await sendMessage(to, text);
+        result = await sendMessage(to, text, data.mentions);
       }
 
       if (result.error) {
