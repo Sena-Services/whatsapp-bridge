@@ -331,13 +331,19 @@ async function startBaileys() {
         console.log(`[bridge] Self-chat message detected (remoteJid=${remoteJid}, connectedPhone=${connectedPhone})`);
       }
 
+      // Unwrap viewOnce/ephemeral wrappers (voice notes come wrapped in viewOnceMessage)
+      const inner = msg.message?.viewOnceMessage?.message
+        || msg.message?.viewOnceMessageV2?.message
+        || msg.message?.ephemeralMessage?.message
+        || msg.message;
+
       const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
+        inner?.conversation ||
+        inner?.extendedTextMessage?.text ||
         "";
 
-      // Detect audio/voice messages
-      const audioMsg = msg.message?.audioMessage;
+      // Detect audio/voice messages (PTT voice notes are audioMessage with ptt:true — not a separate key)
+      const audioMsg = inner?.audioMessage || inner?.pttMessage;
       const isAudio = !!audioMsg;
 
       if (!text && !isAudio) continue;
@@ -352,7 +358,7 @@ async function startBaileys() {
           audioMimetype = audioMsg.mimetype || "audio/ogg";
           console.log(`[bridge] Downloaded audio: ${audioBase64.length} chars base64, mime=${audioMimetype}`);
         } catch (err) {
-          console.error(`[bridge] Failed to download audio:`, err.message || err);
+          console.error(`[bridge] ⚠️ Failed to download audio from ${msg.key.remoteJid}:`, err.message || err);
         }
       }
 
